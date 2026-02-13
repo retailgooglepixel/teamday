@@ -62,7 +62,7 @@
           setDoc, addDoc, query, orderBy, 
           serverTimestamp 
         } from 'firebase/firestore';
-        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+        import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 
         // --- ICONS (Inline SVGs) ---
         const Icon = ({ path, className, size = 24 }) => (
@@ -94,15 +94,7 @@
           measurementId: "G-LWJJVM0W4T"
         };
 
-        // Fallback Logik: Falls die Config oben leer wäre, würde er versuchen
-        // eine Umgebungsvariable zu nutzen. Da wir jetzt echte Daten haben, 
-        // wird immer FIREBASE_CONFIG genommen.
-        const FINAL_CONFIG = (FIREBASE_CONFIG.apiKey !== "HIER_API_KEY_EINFÜGEN") 
-            ? FIREBASE_CONFIG 
-            : (typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null);
-
-        const APP_ID = typeof __app_id !== 'undefined' ? __app_id : 'teamday-2025-prod';
-        const INITIAL_TOKEN = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        const APP_ID = 'teamday-2025-prod';
 
         const COLORS = {
             magenta: '#E20074',
@@ -122,6 +114,8 @@
             const [role, setRole] = useState(null); 
             const [phase, setPhase] = useState('intro'); 
             const [isLoading, setIsLoading] = useState(true); 
+            const [isOffline, setIsOffline] = useState(false); // Neuer Offline-Modus State
+            const [initError, setInitError] = useState(null); 
             
             const [gameState, setGameState] = useState({
                 activeTeam: 'A',
@@ -145,30 +139,35 @@
             // --- FIREBASE INIT ---
             useEffect(() => {
                 const initFirebase = async () => {
-                    if (!FINAL_CONFIG) {
-                        console.warn("Keine Firebase Config gefunden. Demo-Modus.");
+                    if (!FIREBASE_CONFIG) {
+                        console.warn("Keine Config. Offline Modus.");
+                        setIsOffline(true);
                         setIsLoading(false);
                         return;
                     }
                     try {
-                        const app = initializeApp(FINAL_CONFIG);
+                        const app = initializeApp(FIREBASE_CONFIG);
                         const auth = getAuth(app);
                         const db = getFirestore(app);
                         dbRef.current = db;
 
-                        if (INITIAL_TOKEN) {
-                            await signInWithCustomToken(auth, INITIAL_TOKEN);
-                        } else {
-                            await signInAnonymously(auth);
-                        }
+                        await signInAnonymously(auth);
                         
                         onAuthStateChanged(auth, (u) => {
                             setUser(u);
                             setIsLoading(false);
                         });
                     } catch (err) {
-                        console.error("Firebase Init Error:", err);
-                        setIsLoading(false); 
+                        console.error("Firebase Init Error (Starte Offline-Modus):", err);
+                        
+                        let msg = "Fehler: " + err.message;
+                        if (err.code === 'auth/configuration-not-found' || err.code === 'auth/operation-not-allowed') {
+                            msg = "Authentifizierung nicht aktiviert. Bitte in Firebase Console -> Authentication -> Anonymous aktivieren.";
+                        }
+                        
+                        setInitError(msg);
+                        setIsOffline(true); // WICHTIG: Fallback auf Offline
+                        setIsLoading(false);
                     }
                 };
                 initFirebase();
@@ -176,12 +175,12 @@
 
             // --- DATA SYNC ---
             useEffect(() => {
-                if (!user || !dbRef.current) return;
+                if (isOffline || !user || !dbRef.current) return;
                 const db = dbRef.current;
 
                 // Sync Game State
                 const stateDocRef = doc(db, 'artifacts', APP_ID, 'public', 'data', 'gamestate_doc', 'state');
-                setDoc(stateDocRef, { initialized: true }, { merge: true }).catch(() => {});
+                setDoc(stateDocRef, { initialized: true }, { merge: true }).catch(e => console.log("Sync skipped", e));
 
                 const unsubState = onSnapshot(stateDocRef, (docSnap) => {
                     if (docSnap.exists()) {
@@ -191,7 +190,7 @@
                            clearCanvasLocal();
                         }
                     }
-                });
+                }, err => console.log("State sync warning", err));
 
                 // Sync Strokes
                 const strokesQuery = query(collection(db, 'artifacts', APP_ID, 'public', 'data', 'strokes_col'), orderBy('timestamp', 'asc'));
@@ -199,15 +198,15 @@
                     snapshot.docChanges().forEach((change) => {
                         if (change.type === "added") {
                             const stroke = change.doc.data();
-                            if (role !== 'player' || stroke.userId !== user.uid) {
+                            if (role !== 'player' || (user && stroke.userId !== user.uid)) {
                                 drawStrokeRemote(stroke);
                             }
                         }
                     });
-                });
+                }, err => console.log("Strokes sync warning", err));
 
                 return () => { unsubState(); unsubStrokes(); };
-            }, [user, role]); 
+            }, [user, role, isOffline]); 
 
             // --- CANVAS LOGIC ---
             useEffect(() => {
@@ -291,7 +290,8 @@
                 if (!isDrawing || role !== 'player') return;
                 contextRef.current.closePath();
                 setIsDrawing(false);
-                if (user && dbRef.current && localStrokesBuffer.current.length > 1) {
+                // Nur syncen wenn NICHT offline
+                if (!isOffline && user && dbRef.current && localStrokesBuffer.current.length > 1) {
                     const strokeData = {
                         userId: user.uid,
                         color: brushColor,
@@ -299,19 +299,26 @@
                         points: localStrokesBuffer.current,
                         timestamp: serverTimestamp()
                     };
-                    addDoc(collection(dbRef.current, 'artifacts', APP_ID, 'public', 'data', 'strokes_col'), strokeData);
+                    addDoc(collection(dbRef.current, 'artifacts', APP_ID, 'public', 'data', 'strokes_col'), strokeData).catch(e => console.log("Offline ignore"));
                 }
                 localStrokesBuffer.current = [];
             };
 
             // --- ADMIN ACTIONS ---
             const updateGameState = async (updates) => {
-                if (!dbRef.current) return;
-                await setDoc(doc(dbRef.current, 'artifacts', APP_ID, 'public', 'data', 'gamestate_doc', 'state'), updates, { merge: true });
+                // Lokal update (für offline modus)
+                setGameState(prev => ({...prev, ...updates}));
+                
+                // Remote update
+                if (!isOffline && dbRef.current) {
+                    await setDoc(doc(dbRef.current, 'artifacts', APP_ID, 'public', 'data', 'gamestate_doc', 'state'), updates, { merge: true }).catch(e => console.log("Offline ignore"));
+                }
             };
             const clearBoardGlobal = async () => {
-                if (!dbRef.current) return;
-                await updateGameState({ lastClear: Date.now() });
+                clearCanvasLocal(); // Immer lokal löschen
+                if (!isOffline && dbRef.current) {
+                    await updateGameState({ lastClear: Date.now() });
+                }
             };
             const generateWord = (diff) => {
                 const list = WORD_CATEGORIES[diff];
@@ -323,6 +330,8 @@
                 let interval;
                 if (gameState.timerActive && gameState.timeLeft > 0) {
                     interval = setInterval(() => {
+                        // Im Offline Modus läuft der Timer lokal für den Admin weiter
+                        // Im Online Modus triggert der Admin das Update für alle
                         if (role === 'admin') updateGameState({ timeLeft: gameState.timeLeft - 1 });
                     }, 1000);
                 } else if (gameState.timeLeft === 0 && gameState.timerActive && role === 'admin') {
@@ -334,10 +343,12 @@
 
             // --- RENDER ---
             if (phase === 'intro') {
-                setTimeout(() => setPhase('lobby'), 3500);
+                // Increased delay by 3 seconds (5.5s -> 8.5s) to account for animation delay + duration
+                setTimeout(() => setPhase('lobby'), 8500);
                 return (
                     <div className="fixed inset-0 bg-[#161616] overflow-hidden flex items-center justify-center z-50">
-                        <div className="relative w-full h-full flex items-center justify-center" style={{ animation: 'crashZoom 3s cubic-bezier(0.7,0,1,1) forwards' }}>
+                        {/* Added 3s animation-delay */}
+                        <div className="relative w-full h-full flex items-center justify-center" style={{ animation: 'crashZoom 5s cubic-bezier(0.7,0,1,1) 3s forwards' }}>
                              <div className="absolute inset-0 opacity-80" style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg width='80' height='80' viewBox='0 0 80 80' xmlns='http://www.w3.org/2000/svg'%3E%3Ctext x='5' y='20' font-family='monospace' font-weight='bold' font-size='18' fill='%23E20074' opacity='0.9'%3E1%3C/text%3E%3Ctext x='45' y='60' font-family='monospace' font-weight='bold' font-size='22' fill='%23ffffff' opacity='0.8'%3E0%3C/text%3E%3C/svg%3E")` }}></div>
                              <div className="relative z-10 flex flex-col items-center">
                                  <div className="bg-[#161616]/90 backdrop-blur-md p-10 rounded-3xl border border-[#E20074]/50 shadow-[0_0_80px_rgba(226,0,116,0.4)]">
@@ -371,9 +382,18 @@
                             ))}
                         </div>
                          {/* Connection Status Indicator */}
-                        <div className="mt-8 text-gray-500 text-sm flex items-center">
-                            <div className={`w-2 h-2 rounded-full mr-2 ${user ? 'bg-green-500' : 'bg-red-500'}`}></div>
-                            {user ? 'Online (Multiplayer Aktiv)' : 'Offline (Demo Modus - Prüfe Config)'}
+                        <div className="mt-8 text-sm flex flex-col items-center">
+                            <div className="flex items-center mb-1">
+                                <div className={`w-2 h-2 rounded-full mr-2 ${isOffline ? 'bg-red-500' : 'bg-green-500'}`}></div>
+                                <span className="text-gray-400">
+                                    {isOffline ? 'Lokaler Demo-Modus (Offline)' : 'Online Multiplayer Aktiv'}
+                                </span>
+                            </div>
+                            {isOffline && initError && (
+                                <span className="text-red-400 text-xs bg-red-900/20 px-2 py-1 rounded max-w-md text-center">
+                                    {initError}
+                                </span>
+                            )}
                         </div>
                     </div>
                 );
